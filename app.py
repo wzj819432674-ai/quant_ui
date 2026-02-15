@@ -54,7 +54,20 @@ def open_postgres_db():
             "Missing dependency: psycopg. Install with: py -m pip install 'psycopg[binary]>=3.2,<4'"
         ) from exc
 
-    return psycopg.connect(database_url, row_factory=dict_row)
+    normalized_url = database_url.strip()
+    if normalized_url.startswith("postgres://"):
+        normalized_url = "postgresql://" + normalized_url[len("postgres://") :]
+    if "sslmode=" not in normalized_url:
+        normalized_url += ("&" if "?" in normalized_url else "?") + "sslmode=require"
+    if "connect_timeout=" not in normalized_url:
+        normalized_url += ("&" if "?" in normalized_url else "?") + "connect_timeout=10"
+
+    try:
+        return psycopg.connect(normalized_url, row_factory=dict_row)
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to connect to Postgres. Check APP_DATABASE_URL, DB password, and pooler host."
+        ) from exc
 
 
 def init_auth_db() -> None:
@@ -196,6 +209,12 @@ def notify_admin_new_signup(username: str) -> tuple[bool, str]:
     sent_any = sent_any or email_sent
 
     return sent_any, "; ".join(results)
+
+
+def external_notifications_configured() -> bool:
+    webhook_url = get_config_value("APP_NOTIFY_WEBHOOK_URL")
+    has_email = bool(get_config_value("APP_SMTP_HOST") and get_config_value("APP_NOTIFY_EMAIL_TO"))
+    return bool(webhook_url or has_email)
 
 
 def create_user(username: str, password: str, is_admin: bool = False, is_approved: bool = False) -> tuple[bool, str]:
@@ -397,7 +416,10 @@ def logout() -> None:
 def render_admin_panel() -> None:
     with st.sidebar.expander("Admin: Access Control", expanded=False):
         st.caption("Approve or revoke user accounts.")
-        st.write(f"Pending approvals: `{count_pending_users()}`")
+        pending = count_pending_users()
+        st.write(f"Pending approvals: `{pending}`")
+        if pending > 0:
+            st.warning("New signup requests are waiting for approval.")
         users = list_regular_users()
         if not users:
             st.write("No non-admin users yet.")
@@ -419,7 +441,22 @@ def render_admin_panel() -> None:
 
 
 def require_auth() -> None:
-    init_auth_db()
+    try:
+        init_auth_db()
+    except Exception as exc:
+        st.title("Database Connection Error")
+        st.error("Auth database is unreachable, so login cannot start.")
+        st.write("Check your Streamlit Secrets and then reboot app.")
+        st.code(
+            'APP_DATABASE_URL = "postgresql://postgres.<project_ref>:<db_password>@<pooler-host>:5432/postgres?sslmode=require"'
+        )
+        st.caption(
+            "Use Supabase Session Pooler URI. Keep this in one line and replace [YOUR-PASSWORD] with the real DB password."
+        )
+        with st.expander("Technical details"):
+            st.text(str(exc))
+        st.stop()
+
     init_auth_state()
 
     if not ensure_admin_user():
@@ -463,6 +500,9 @@ def require_auth() -> None:
                 st.rerun()
 
         if st.session_state.auth_is_admin:
+            pending = count_pending_users()
+            if pending > 0:
+                st.sidebar.warning(f"{pending} pending signup request(s)")
             render_admin_panel()
         elif not st.session_state.auth_is_approved:
             st.warning("Your account is pending approval by admin.")
@@ -508,11 +548,14 @@ def require_auth() -> None:
                 ok, message = create_user(new_username, new_password, is_admin=False, is_approved=False)
                 if ok:
                     st.success("Account created. Wait for admin approval before logging in.")
-                    sent, notify_message = notify_admin_new_signup(normalize_username(new_username))
-                    if sent:
-                        st.info("Admin notification sent.")
+                    if external_notifications_configured():
+                        sent, notify_message = notify_admin_new_signup(normalize_username(new_username))
+                        if sent:
+                            st.info("Admin notification sent.")
+                        else:
+                            st.warning(f"Account created, but admin notification was not sent ({notify_message}).")
                     else:
-                        st.warning(f"Account created, but admin notification was not sent ({notify_message}).")
+                        st.info("Request was added to Admin UI pending list.")
                 else:
                     st.error(message)
 
